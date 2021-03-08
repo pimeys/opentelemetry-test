@@ -1,12 +1,12 @@
-use std::{collections::HashMap, convert::Infallible, net::SocketAddr};
+use std::{collections::HashMap, convert::Infallible, net::SocketAddr, thread, time::Duration};
 
 use hyper::{
     server::Server,
     service::{make_service_fn, service_fn},
     Body, Client, Request, Response, Uri,
 };
-use opentelemetry::{propagation::TextMapPropagator, sdk::propagation::TraceContextPropagator};
-use opentelemetry_jaeger::Uninstall;
+use opentelemetry::global;
+use opentelemetry_jaeger::{Propagator, Uninstall};
 use structopt::StructOpt;
 use tracing::subscriber;
 use tracing_futures::Instrument;
@@ -24,6 +24,8 @@ enum Opt {
 }
 
 fn set_subscriber() -> anyhow::Result<Uninstall> {
+    global::set_text_map_propagator(Propagator::new());
+
     let (tracer, uninstall) = opentelemetry_jaeger::new_pipeline()
         .with_service_name("tracing test")
         .install()?;
@@ -44,14 +46,24 @@ async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
         .collect();
 
     // The span created here should have client's span as the parent.
-    let span = tracing::trace_span!("server handle");
-    let propagator = TraceContextPropagator::new();
+    let span = tracing::trace_span!("server handle", "otel.kind" = "server");
 
-    let cx = propagator.extract_with_context(&span.context(), &headers);
+    let cx = global::get_text_map_propagator(|propagator| propagator.extract(&headers));
     span.set_parent(cx);
 
     let _guard = span.enter();
+    thread::sleep(Duration::from_millis(300));
+
+    do_something();
+
     Ok(Response::new(Body::from("hello, world!")))
+}
+
+fn do_something() {
+    let span = tracing::trace_span!("doing something", "otel.kind" = "server");
+    let _guard = span.enter();
+
+    thread::sleep(Duration::from_millis(100));
 }
 
 async fn bind_server() -> anyhow::Result<()> {
@@ -67,12 +79,11 @@ async fn bind_server() -> anyhow::Result<()> {
 
 async fn call_server() -> anyhow::Result<()> {
     // This should be the parent span.
-    let span = tracing::trace_span!("client handle");
-    let ctx = span.context();
+    let span = tracing::trace_span!("client handle", "otel.kind" = "client");
+    let cx = span.context();
 
     let mut headers = HashMap::new();
-    let propagator = TraceContextPropagator::new();
-    propagator.inject_context(&ctx, &mut headers);
+    global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut headers));
 
     let client = Client::new();
 
